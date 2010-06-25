@@ -17,9 +17,7 @@
 import ioloop, iostream
 import logging, os, socket, types, re, sys, errno
 import time
-'''
-import functools
-'''
+import threading
 
 try:
     import fcntl
@@ -31,7 +29,6 @@ except ImportError:
 
 # Cache the hostname (XXX Yes - this is broken)
 HOST_NAME = socket.gethostname() if sys.platform == 'darwin' else socket.getfqdn()
-EMPTYSTRING = ''
 
 ALLOW, DENY, DENY_DISCONNECT, DENYSOFT, DENYSOFT_DISCONNECT, DONE = range(6)
 
@@ -53,28 +50,19 @@ class ServerWatchdog:
 ########################################################################
 class MessageDelivery(object):
     #----------------------------------------------------------------------
-    def received_header(self, helo, origin, recipients):
+    def begin_session(self, helo, peer_ip):
         """
-        Generate the Received header for a message
-
-        @type helo: C{(str, str)}
-        @param helo: The argument to the HELO command and the client's IP
-        address.
-
-        @type origin: C{EmailAddress}
-        @param origin: The address the message is from
-
-        @type recipients: C{list} of L{SMTPUser}
-        @param recipients: A list of the addresses for which this message
-        is bound.
-
-        @rtype: C{str}
-        @return: The full \"Received\" header string.
+        Return a unique session id
         """
+        return None
+    
+    #----------------------------------------------------------------------
+    def reset_session(self, session_token):
+        """"""
         pass
-
-        #----------------------------------------------------------------------    
-    def verify_recipient(self, user):
+    
+    #----------------------------------------------------------------------    
+    def verify_recipient(self, session_token, user):
         """
         Validate the address for which the message is destined.
 
@@ -89,11 +77,13 @@ class MessageDelivery(object):
 
         @raise SMTPBadRcpt: Raised if messages to the address are
         not to be accepted.
+        
+        return CODE
         """
         pass
 
     #----------------------------------------------------------------------    
-    def validate_recipient(self, user):
+    def validate_recipient(self, session_token, mailfrom, rcptto):
         """
         Validate the address for which the message is destined.
 
@@ -108,11 +98,13 @@ class MessageDelivery(object):
 
         @raise SMTPBadRcpt: Raised if messages to the address are
         not to be accepted.
+        
+        return (CODE, EmailAddress)
         """
         pass
 
     #----------------------------------------------------------------------    
-    def validate_sender(self, helo, origin):
+    def validate_sender(self, session_token, helo, mailfrom):
         """
         Validate the address from which the message originates.
 
@@ -129,8 +121,16 @@ class MessageDelivery(object):
 
         @raise SMTPBadSender: Raised of messages from this address are
         not to be accepted.
+        
+        # return CODE, + EmailAddress
         """
         pass
+    
+    # Do something with the gathered message
+    # return CODE[, Message]
+    def message_received(self, session_token, mailfrom, rcpttos, data):
+        pass
+    
 
 ########################################################################
 class MessageDeliveryFactory(object):
@@ -152,31 +152,6 @@ class MessageDeliveryFactory(object):
         return None
     
 ########################################################################       
-class SMTPError(Exception):
-    def __init__(self, code, resp):
-        self.code = code
-        self.resp = resp
-
-    def __str__(self):
-        return "%.3d %s" % (self.code, self.resp)
-
-class SMTPAddressError(SMTPError):
-    def __init__(self, addr, code, resp):
-        SMTPError.__init__(self, code, resp)
-        self.addr = EmailAddress(addr)
-
-    def __str__(self):
-        return "%.3d <%s>... %s" % (self.code, self.addr, self.resp)
-
-class SMTPBadRecipient(SMTPError):
-    def __init__(self, addr, code=550,
-                 resp='Cannot receive for specified address'):
-        SMTPAddressError.__init__(self, addr, code, resp)
-
-class SMTPBadSender(SMTPError):
-    def __init__(self, addr, code=550, resp='Sender not acceptable'):
-        SMTPAddressError.__init__(self, addr, code, resp)
-
 
 class AddressError(Exception):
     "Parse error in address"
@@ -205,8 +180,6 @@ class EmailAddress:
     atomre = re.compile(atom) # match any one atom character
 
     def __init__(self, addr, defaultDomain=None):
-        if isinstance(addr, SMTPUser):
-            addr = addr.dest
         if isinstance(addr, EmailAddress):
             self.__dict__ = addr.__dict__.copy()
             return
@@ -283,54 +256,6 @@ class EmailAddress:
     def __repr__(self):
         return "%s.%s(%s)" % (self.__module__, self.__class__.__name__,
                               repr(str(self)))
-
-class SMTPUser:
-    """Hold information about and SMTP message recipient,
-    including information on where the message came from
-    """
-
-    def __init__(self, destination, helo, conn, orig):
-        host = getattr(conn, 'host', None)
-        self.dest = EmailAddress(destination, host)
-        self.helo = helo
-        self.conn = conn
-        if isinstance(orig, EmailAddress):
-            self.orig = orig
-        else:
-            self.orig = EmailAddress(orig, host)
-
-    def __getstate__(self):
-        """Helper for pickle.
-
-        conn isn't picklabe, but we want SMTPUser to be, so skip it in
-        the pickle.
-        """
-        return { 'dest' : self.dest,
-                 'helo' : self.helo,
-                 'conn' : None,
-                 'orig' : self.orig }
-
-    def __str__(self):
-        return str(self.dest)
-
-class MessageReceiver(object):
-    """Interface definition for messages that can be sent via SMTP."""
-
-    def line_received(self, line):
-        """handle another line"""
-
-    def eom_received(self):
-        """handle end of message
-
-        return a deferred. The deferred should be called with either:
-        callback(string) or errback(error)
-        """
-
-    def connection_lost(self):
-        """handle message truncated
-
-        semantics should be to discard the message
-        """    
 
 ########################################################################
 class SMTPServer(object):
@@ -443,10 +368,6 @@ class SMTPServer(object):
                 SMTPClientConnection(self, self.io_loop, stream, peer, self.delivery, self.delivery_factory)
             except:
                 logging.error("Error in connection callback", exc_info=True)
-                
-    # Do something with the gathered message
-    def _process_message(self, peer, mailfrom, rcpttos, data):
-        pass
     
 
 COMMAND, DATA, AUTH = 'COMMAND', 'DATA', 'AUTH'
@@ -454,8 +375,9 @@ COMMAND, DATA, AUTH = 'COMMAND', 'DATA', 'AUTH'
 class SMTPClientConnection(object):
     """SMTP server-side protocol."""
 
-    timeout = 30.0
-    timeout_final = 60.0
+    timeout_command = 30.0
+    timeout_data = 30.0
+    timeout_lifespan = 60.0
     fqdn = HOST_NAME
     TERM_EOL = '\r\n'
     TERM_EOM = '\r\n.\r\n'
@@ -490,11 +412,10 @@ class SMTPClientConnection(object):
         
         self.__timeout_obj = None
         self.__timeout_id = None
-        #self.__timeout_final = self._io_loop.add_timeout(self.timeout_final + time.time(), self.__timed_out_final, None)
-        
-        self.ac_in_buffer = b''
-        self.__line = []
-        self.__data = b''
+        self.__timeout_lifespan = self._io_loop.add_timeout(self.timeout_lifespan + time.time(),
+                                                            self.__timed_out_lifespan, 
+                                                            None)
+        self._session_token = None        
         
         self.send_greeting()
         self.post_read_request()
@@ -503,8 +424,9 @@ class SMTPClientConnection(object):
     def get_terminator(self):
         return self.TERM_EOM if self.mode == DATA else self.TERM_EOL
     
-    def __timed_out_final(self, param):
-        self.__timed_out_final = None
+    def __timed_out_lifespan(self, param):
+        self.__timeout_lifespan = None
+        self.reset_session()
         self.respond(421, "Game over pal! You just can't stay that long...")
         self.close()
 
@@ -518,7 +440,9 @@ class SMTPClientConnection(object):
 
     def _close_connection(self):
         self.reset_timeout()
-        #if self.__timed_out_final is not None: self._io_loop.remove_timeout(self.__timeout_final)
+        if self.__timeout_lifespan is not None: 
+            self._io_loop.remove_timeout(self.__timeout_lifespan)
+        self.reset_session()
         self._pending_close = False
         self._stream.close()        
         
@@ -559,46 +483,10 @@ class SMTPClientConnection(object):
     def _on_read_data(self, data):
         #print '\t\t\t<<<%s' % data
         self.reset_timeout()
-        #self.ac_in_buffer = self.ac_in_buffer + data
-        #self.__line.append(data)
-        self.found_terminator(data)
-        
-        '''
-        terminator_len = len(self.get_terminator())
-        
-        while self.ac_in_buffer:
-            lb = len(self.ac_in_buffer)
-            index = self.ac_in_buffer.find(self.get_terminator())
-            if index != -1:
-                # we found the terminator
-                if index > 0:
-                    # don't bother reporting the empty string (source of subtle bugs)
-                    self.__line.append(self.ac_in_buffer[:index])
-                self.ac_in_buffer = self.ac_in_buffer[index+terminator_len:]
-                # This does the Right Thing if the terminator is changed here.
-                self.found_terminator()
-            else:
-                # check for a prefix of the terminator
-                index = find_prefix_at_end (self.ac_in_buffer, self.get_terminator())
-                if index:
-                    if index != lb:
-                        # we found a prefix, collect up to the prefix
-                        self.__line.append(self.ac_in_buffer[:-index])
-                        self.ac_in_buffer = self.ac_in_buffer[-index:]
-                    break
-                else:
-                    # no prefix, collect it all
-                    self.__line.append(self.ac_in_buffer)
-                    self.ac_in_buffer = ''
-        '''
-    
-    def found_terminator(self, data):
-        #line = EMPTYSTRING.join(self.__line)
-        #self.__line = []
         ret = getattr(self, 'state_' + self.mode)(data)
         if ret != False:
             self.post_read_request()
-        
+    
     def state_COMMAND(self, line):
         # Ignore leading and trailing whitespace, as well as an arbitrary
         # amount of whitespace between the command and its argument, though
@@ -614,15 +502,9 @@ class SMTPClientConnection(object):
                 method('')
         else:
             self.respond(500, 'Bad syntax')
-            
+    
     def lookup_method(self, command):
         return getattr(self, 'smtp_' + command.upper(), None)
-    
-    #----------------------------------------------------------------------
-    def reset_session(self):
-        """"""
-        self._from = None
-        self._recipients = []        
     
     def smtp_UNKNOWN(self, rest):
         self.respond(500, 'Unrecognized command')
@@ -635,8 +517,7 @@ class SMTPClientConnection(object):
             self.respond(503, 'but you already said HELO...')
         else:
             self._helo = arg
-            self._from = None
-            self._recipients = []
+            self.begin_session()
             self.respond(250, '%s Hello %s, nice to meet you' % (self.fqdn, arg))        
 
     def smtp_QUIT(self, arg):
@@ -678,7 +559,7 @@ class SMTPClientConnection(object):
                          )\s*(\s(?P<opts>.*))? # Optional WS + ESMTP options
                          $''',re.I|re.X)
 
-    def smtp_MAIL(self, rest):
+    def smtp_MAIL(self, arg):
         if self._helo == None:
             self.respond(503, "Don't be rude, say hello first...")
             return
@@ -686,8 +567,7 @@ class SMTPClientConnection(object):
             self.respond(503, "Only one sender per message, please")
             return
         
-        self.reset_session()
-        m = self.mail_re.match(rest)
+        m = self.mail_re.match(arg)
         if not m:
             self.respond(501, "Syntax error")
             return
@@ -699,7 +579,7 @@ class SMTPClientConnection(object):
             return
         
         try:
-            ret = self.validate_sender(addr)
+            ret, addr = self._validate_sender(addr)
             if ret == DENY:
                 self.respond(550, 'Denied')
                 return
@@ -707,10 +587,12 @@ class SMTPClientConnection(object):
                 self.respond(450, 'Temporarily denied')
                 return
             elif ret == DENY_DISCONNECT:
+                self.reset_session()
                 self.respond(550, 'Denied')
                 self.close()
                 return False
             elif ret == DENYSOFT_DISCONNECT:
+                self.reset_session()
                 self.respond(421, 'Temporarily denied')
                 self.close()
                 return False
@@ -722,7 +604,7 @@ class SMTPClientConnection(object):
         self._from = addr
         self.respond(250, 'Sender OK')
     
-    def validate_sender(self, sender_addr):
+    def _validate_sender(self, mailfrom):
         """
         Validate the address from which the message originates.
 
@@ -740,13 +622,10 @@ class SMTPClientConnection(object):
         @raise SMTPBadSender: Raised of messages from this address are
         not to be accepted.
         """
-        if self.delivery_factory is not None:
-            self.delivery = self.delivery_factory.getMessageDelivery()
-
         if self.delivery is not None:
-            return self.delivery.validate_sender(self._helo, sender_addr)
+            return self.delivery.validate_sender(self._session_token, self._helo, mailfrom)
         
-        return ALLOW
+        return DENY, None
     
     def smtp_RCPT(self, arg):
         if not self._from:
@@ -758,13 +637,13 @@ class SMTPClientConnection(object):
             return
 
         try:
-            user = SMTPUser(m.group('path'), self._helo, self, self._from)
+            addr = EmailAddress(m.group('path'), self.fqdn)
         except AddressError, e:
             self.respond(553, str(e))
             return
         
         try:
-            ret, msg_proc = self.validate_recipient(user)
+            ret, addr = self._validate_recipient(addr)
             if ret == DENY:
                 self.respond(550, 'Relaying denied')
                 return
@@ -772,22 +651,24 @@ class SMTPClientConnection(object):
                 self.respond(450, 'Relaying denied')
                 return
             elif ret == DENY_DISCONNECT:
+                self.reset_session()
                 self.respond(550, 'Delivery denied')
                 self.close()
                 return False
             elif ret == DENYSOFT_DISCONNECT:
+                self.reset_session()
                 self.respond(421, 'Delivery denied')
                 self.close()
                 return False
         except Exception, exc:
-            logging.error("SMTP sender (%s) validation failure" % (user.dest,))
+            logging.error("SMTP receiver (%s) validation failure" % (addr,))
             self.respond(451, 'Internal server error')            
             return
         
-        self._recipients.append((user, msg_proc))
+        self._recipients.append(addr)
         self.respond(250, "Recipient OK")
     
-    def validate_recipient(self, user):
+    def _validate_recipient(self, rcptto):
         """
         Validate the address for which the message is destined.
 
@@ -802,176 +683,44 @@ class SMTPClientConnection(object):
 
         @raise SMTPBadRcpt: Raised if messages to the address are
         not to be accepted.
+        return (CODE, EmailAddress)
         """
         if self.delivery is not None:
-            return self.delivery.validate_recipient(user)
+            return self.delivery.validate_recipient(self._session_token, self._from, rcptto)
         return DENY, None
     
     def smtp_DATA(self, rest):
         if self._from is None or (not self._recipients):
             self.respond(503, 'Must have valid receiver and originator')
             return
+        
         self.mode = DATA
-        helo, origin = self._helo, self._from
-        recipients = self._recipients
-
-        self._from = None
-        self._recipients = []
-        self.datafailed = None
-
-        msgs = []
-        for (user, msgFunc) in recipients:
-            try:
-                msg = msgFunc()
-                rcvdhdr = self.received_header(helo, origin, [user])
-                if rcvdhdr:
-                    msg.line_received(rcvdhdr)
-                msgs.append(msg)
-            except SMTPError, e:
-                self.respond(e.code, e.resp)
-                self.mode = COMMAND
-                self._disconnect(msgs)
-                return
-            except Exception, e:
-                logging.error(e)
-                self.respond(550, "Internal server error")
-                self.mode = COMMAND
-                self._disconnect(msgs)
-                return
-        self.__messages = msgs
-        
-        self.__inheader = self.__inbody = 0
         self.respond(354, 'Continue')
-        
+            
         #if True:
         #fmt = 'Receiving message for delivery: from=%s to=%s'
-        #logging.error(fmt % (origin, [str(u) for (u, f) in recipients]))        
+        #logging.error(fmt % (origin, [str(u) for (u, f) in recipients]))
 
-    def _disconnect(self, msgs):
-        for msg in msgs:
-            try:
-                msg.connection_lost()
-            except:
-                logging.error("msg raised exception from connection_lost")
-    
-    
-    #def state_DATA(self, line):
-    def data_line_received(self, line):
-        resp = []
-        for m in self.__messages:
-            resp.append(m.eom_received())
-        
-        self._message_handled(resp)
-
-        del self.__messages
+    def state_DATA(self, data):
         self.mode = COMMAND
-        '''
-        if line[:1] == '.':
-            if line == '.':
-                self.mode = COMMAND
-                if self.datafailed:
-                    self.respond(self.datafailed.code,
-                                  self.datafailed.resp)
-                    return False
-                if not self.__messages:
-                    self._message_handled("thrown away")
-                    return False
-                
-                resp = []
-                for m in self.__messages:
-                    resp.append(m.eom_received())
-                
-                self._message_handled(resp)
-
-                del self.__messages
-                return False
-            line = line[1:]
-        
-        if self.datafailed:
-            return False
-
-        try:
-            # Add a blank line between the generated Received:-header
-            # and the message body if the message comes in without any
-            # headers
-            if not self.__inheader and not self.__inbody:
-                if ':' in line:
-                    self.__inheader = 1
-                elif line:
-                    for message in self.__messages:
-                        message.line_received('')
-                    self.__inbody = 1
-
-            if not line:
-                self.__inbody = 1
-
-            for message in self.__messages:
-                message.line_received(line)
-        except SMTPError, e:
-            self.datafailed = e
-            for message in self.__messages:
-                message.connection_lost()
-        return True
-        '''
-    
-    state_DATA = data_line_received
-    #def state_DATA(self, line):
-        #if self.data_line_received(line): self._stream.read_until(self.get_terminator(), self._on_read_data)
-
-    def _message_handled(self, resultList):
-        failures = 0
-        for (success, result) in resultList:
-            if success != ALLOW:
-                failures += 1
-                log.err(result)
-        if failures:
-            msg = 'Could not send e-mail'
-            L = len(resultList)
-            if L > 1:
-                msg += ' (%d failures out of %d recipients)' % (failures, L)
-            self.respond(550, msg)
-        else:
+        ret, msg = self.message_received(data)
+        self.reset_session()
+        if ret == ALLOW:
             self.respond(250, 'Delivery in progress')
-        return False
+        else:
+            self.respond(550, msg)
     
-    def connection_lost(self, reason):
-        # self.respond(421, 'Dropping connection.') # This does nothing...
-        # Ideally, if we (rather than the other side) lose the connection,
-        # we should be able to tell the other side that we are going away.
-        # RFC-2821 requires that we try.
-        if self.mode is DATA:
-            try:
-                for message in self.__messages:
-                    try:
-                        message.connection_lost()
-                    except Exception, e:
-                        logging.error(e)
-                del self.__messages
-            except AttributeError:
-                pass
-        self.reset_timeout()
-        
-    def received_header(self, helo, origin, recipients):
+    def message_received(self, data):
         if self.delivery is not None:
-            return self.delivery.received_header(helo, origin, recipients)
-
-        heloStr = ""
-        if helo[0]:
-            heloStr = " helo=%s" % (helo[0],)
-        domain = self.peer_ip
-        from_ = "from %s ([%s]%s)" % (helo[0], helo[1], heloStr)
-        by = "by %s with %s (%s)" % (domain,
-                                     self.__class__.__name__,
-                                     longversion)
-        for_ = "for %s; %s" % (' '.join(map(str, recipients)),
-                               rfc822date())
-        return "Received: %s\n\t%s\n\t%s" % (from_, by, for_)
+            return self.delivery.message_received(self._session_token, self._from, self._recipients, data)
+        return DENY, None
     
-
     #----------------------------------------------------------------------
     def set_timeout(self, timeout=None, N=uniq_id().next):
-        '''        
-        deadline = timeout if timeout else self.timeout
+        if (timeout is not None) & (timeout > 0):
+            deadline = timeout
+        else:
+            deadline = self.timeout_data if self.mode == DATA else self.timeout_command
         if deadline is not None:
             deadline += time.time()
             if self.__timeout_obj is not None:
@@ -980,15 +729,12 @@ class SMTPClientConnection(object):
             
             self.__timeout_id = N()
             self.__timeout_obj = self._io_loop.add_timeout(deadline, self.__timed_out, self.__timeout_id)
-        '''
-        
+    
     def reset_timeout(self):
-        '''        
         if self.__timeout_obj is not None:
             self._io_loop.remove_timeout(self.__timeout_obj)
             self.__timeout_id = None
             self.__timeout_obj = None
-        '''
     
     def __timed_out(self, param):
         self.__timeout_obj = None
@@ -1000,13 +746,25 @@ class SMTPClientConnection(object):
         """"""
         self.respond(421, 'Timeout. Try talking faster next time!')
         self.close()        
+    
+    #----------------------------------------------------------------------
+    def begin_session(self):
+        """"""
+        if self.delivery_factory is not None:
+            self.delivery = self.delivery_factory.getMessageDelivery()
 
-
-def find_prefix_at_end (haystack, needle):
-    l = len(needle) - 1
-    while l and not haystack.endswith(needle[:l]):
-        l -= 1
-    return l
+        if self.delivery is not None:
+            self._session_token = self.delivery.begin_session(self._helo, self.peer_ip)
+    
+    #----------------------------------------------------------------------
+    def reset_session(self):
+        """"""
+        if self.delivery is not None and self._session_token is not None:
+            self.delivery.reset_session(self._session_token)
+        
+        self._session_token = None
+        self._from = None
+        self._recipients = []
 
 
 ########### TEST ###########################################################
@@ -1014,47 +772,31 @@ def find_prefix_at_end (haystack, needle):
 email = EmailAddress('abc@gmail.com')
 email = EmailAddress('samarah', 'kumkum.masroor')
 
-class ConsoleMessageDelivery(MessageDelivery):
-    def received_header(self, helo, origin, recipients):
-        return "Received: ConsoleMessageDelivery"
-    
-    def validate_sender(self, helo, origin):
+class DummyMessageDelivery(MessageDelivery):
+    def validate_sender(self, session_token, helo, mailfrom):
         # All addresses are accepted
-        return ALLOW
+        return (ALLOW, mailfrom)
     
-    def validate_recipient(self, user):
+    def validate_recipient(self, session_token, mailfrom, rcptto):
         # Only messages directed to the "console" user are accepted.
-        if user.dest.local == "c":
-            #return (ALLOW, lambda: ConsoleMessage())
-            return (ALLOW, ConsoleMessage)
+        if rcptto.local == "c":
+            return (ALLOW, rcptto)
         return (DENY, None)
 
     def verify_recipient(self, user):
-        return None
-
-class ConsoleMessage(MessageReceiver):
-    def __init__(self):
-        self.lines = []
-        self.count = 0
+        return DENY
     
-    def line_received(self, line):
-        self.lines.append(line)
+    def message_received(self, session_token, mailfrom, rcpttos, data):
+        return (ALLOW, 'Ok')
     
-    def eom_received(self):
-        #print "New message received:\n----------------------------"
-        #print "\n".join(self.lines)
-        #print '----------------------------'
-        self.lines = None
-        self.count += 1
-        
-        return ALLOW, ""
-        #return defer.succeed(None)
-    
-    def connection_lost(self):
-        # There was an error, throw away the stored lines
-        self.lines = None
-        print "Connection lost"
-
-srv = SMTPServer(None, None, ConsoleMessageDelivery(), num_processes=2)
+srv = SMTPServer(None, None, DummyMessageDelivery(), num_processes=1)
 srv.listen(8888)
-ioloop.IOLoop.instance().start()
+try:
+    #poller = threading.Thread(target=ioloop.IOLoop.instance().start)
+    #poller.start()
+    ioloop.IOLoop.instance().start()
+except KeyboardInterrupt as key:
+    srv.stop()
+    
+    
+    
