@@ -76,6 +76,24 @@ class IOStream(object):
         self.io_loop.add_handler(
             self.socket.fileno(), self._handle_events, self._state)
 
+    #----------------------------------------------------------------------
+    def _check_delim(self, delimiter, callback):
+        """"""
+        delim_len = len(delimiter)
+        
+        if self._read_buffer:
+            lb = len(self._read_buffer)
+            index = self._read_buffer.find(delimiter)
+            if index != -1:
+                # we found the terminator
+                data = self._consume(index + delim_len)
+                if index > 0:
+                    # don't bother reporting the empty string (source of subtle bugs)
+                    self._run_callback(callback, data)
+                    return True
+        
+        return False
+    
     def read_until(self, delimiter, callback):
         """Call callback when we read the given delimiter."""
         assert not self._read_callback, "Already reading"

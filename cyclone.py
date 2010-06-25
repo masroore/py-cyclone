@@ -411,7 +411,7 @@ class SMTPServer(object):
                     self.io_loop = ioloop.IOLoop.instance()
                     self.io_loop.add_handler(
                         self._socket.fileno(),
-                        self._handle_accepts,
+                        self._handle_accept,
                         ioloop.IOLoop.READ)
                     return
             os.waitpid(-1, 0)
@@ -457,7 +457,8 @@ class SMTPClientConnection(object):
     timeout = 30.0
     timeout_final = 60.0
     fqdn = HOST_NAME
-    TERMINATOR = '\r\n'
+    TERM_EOL = '\r\n'
+    TERM_EOM = '\r\n.\r\n'
 
     # A factory for IMessageDelivery objects.  If an
     # avatar implementing IMessageDeliveryFactory can
@@ -489,17 +490,22 @@ class SMTPClientConnection(object):
         
         self.__timeout_obj = None
         self.__timeout_id = None
-        self.__timeout_final = self._io_loop.add_timeout(self.timeout_final + time.time(), self.__timed_out_final, None)
+        #self.__timeout_final = self._io_loop.add_timeout(self.timeout_final + time.time(), self.__timed_out_final, None)
         
         self.ac_in_buffer = b''
         self.__line = []
         self.__data = b''
         
         self.send_greeting()
+        self.post_read_request()
+        
+    #----------------------------------------------------------------------
+    def get_terminator(self):
+        return self.TERM_EOM if self.mode == DATA else self.TERM_EOL
     
     def __timed_out_final(self, param):
         self.__timed_out_final = None
-        self.respond(421, "Game over pal! You just can't stay that long...", False)
+        self.respond(421, "Game over pal! You just can't stay that long...")
         self.close()
 
     def send_greeting(self):
@@ -512,13 +518,11 @@ class SMTPClientConnection(object):
 
     def _close_connection(self):
         self.reset_timeout()
-        if self.__timed_out_final is not None:
-            self._io_loop.remove_timeout(self.__timeout_final)
+        #if self.__timed_out_final is not None: self._io_loop.remove_timeout(self.__timeout_final)
         self._pending_close = False
         self._stream.close()        
-        return
         
-    def respond(self, status_code, message='', timeout=True):
+    def respond(self, status_code, message=''):
         "Send an SMTP code with a message."
         lines = message.splitlines()
         lastline, tmplines = lines[-1:], []
@@ -526,12 +530,11 @@ class SMTPClientConnection(object):
             tmplines.append('%3.3d-%s' % (status_code, line))
         tmplines.append('%3.3d %s' % (status_code, lastline and lastline[0] or ''))
         self.write_line('\r\n'.join(tmplines))
-        if timeout:
-            self.set_timeout()
         
     def write_line(self, message):
-        self.write(message + '\r\n')
-        
+        if not self._stream.closed():
+            self._stream.write(message + '\r\n', self._on_write_complete)
+    
     def write(self, chunk):
         if not self._stream.closed():
             self._stream.write(chunk, self._on_write_complete)
@@ -542,19 +545,30 @@ class SMTPClientConnection(object):
         if self._pending_close:
             self._close_connection()
             return
+    
+    #----------------------------------------------------------------------
+    def post_read_request(self, timeout=True):
+        """"""
+        if self._pending_close:
+            return
         
-        #TODO: what to do next?        
-        self._stream.read_until(self.TERMINATOR, self._on_read_data)
-        self.set_timeout()
+        self._stream.read_until(self.get_terminator(), self._on_read_data)
+        if timeout:
+            self.set_timeout()
     
     def _on_read_data(self, data):
+        #print '\t\t\t<<<%s' % data
         self.reset_timeout()
-        self.ac_in_buffer = self.ac_in_buffer + data
-        terminator_len = len(self.TERMINATOR)
+        #self.ac_in_buffer = self.ac_in_buffer + data
+        #self.__line.append(data)
+        self.found_terminator(data)
+        
+        '''
+        terminator_len = len(self.get_terminator())
         
         while self.ac_in_buffer:
             lb = len(self.ac_in_buffer)
-            index = self.ac_in_buffer.find(self.TERMINATOR)
+            index = self.ac_in_buffer.find(self.get_terminator())
             if index != -1:
                 # we found the terminator
                 if index > 0:
@@ -565,7 +579,7 @@ class SMTPClientConnection(object):
                 self.found_terminator()
             else:
                 # check for a prefix of the terminator
-                index = find_prefix_at_end (self.ac_in_buffer, self.TERMINATOR)
+                index = find_prefix_at_end (self.ac_in_buffer, self.get_terminator())
                 if index:
                     if index != lb:
                         # we found a prefix, collect up to the prefix
@@ -576,11 +590,14 @@ class SMTPClientConnection(object):
                     # no prefix, collect it all
                     self.__line.append(self.ac_in_buffer)
                     self.ac_in_buffer = ''
+        '''
     
-    def found_terminator(self):
-        line = EMPTYSTRING.join(self.__line)
-        self.__line = []
-        getattr(self, 'state_' + self.mode)(line)
+    def found_terminator(self, data):
+        #line = EMPTYSTRING.join(self.__line)
+        #self.__line = []
+        ret = getattr(self, 'state_' + self.mode)(data)
+        if ret != False:
+            self.post_read_request()
         
     def state_COMMAND(self, line):
         # Ignore leading and trailing whitespace, as well as an arbitrary
@@ -625,6 +642,7 @@ class SMTPClientConnection(object):
     def smtp_QUIT(self, arg):
         self.respond(221, 'See you later')
         self.close()        
+        return False
     
     def smtp_RSET(self, arg):
         self.reset_session()
@@ -691,16 +709,15 @@ class SMTPClientConnection(object):
             elif ret == DENY_DISCONNECT:
                 self.respond(550, 'Denied')
                 self.close()
-                return
+                return False
             elif ret == DENYSOFT_DISCONNECT:
                 self.respond(421, 'Temporarily denied')
                 self.close()
-                return
+                return False
         except Exception, exc:
             logging.error("SMTP sender (%s) validation failure %s" % (addr, exc))
             self.respond(451, 'Internal server error')
-            raise
-            #return
+            return
         
         self._from = addr
         self.respond(250, 'Sender OK')
@@ -757,16 +774,15 @@ class SMTPClientConnection(object):
             elif ret == DENY_DISCONNECT:
                 self.respond(550, 'Delivery denied')
                 self.close()
-                return
+                return False
             elif ret == DENYSOFT_DISCONNECT:
                 self.respond(421, 'Delivery denied')
                 self.close()
-                return
+                return False
         except Exception, exc:
             logging.error("SMTP sender (%s) validation failure" % (user.dest,))
-            self.respond(451, 'Internal server error')
-            raise
-            #return
+            self.respond(451, 'Internal server error')            
+            return
         
         self._recipients.append((user, msg_proc))
         self.respond(250, "Recipient OK")
@@ -841,6 +857,15 @@ class SMTPClientConnection(object):
     
     #def state_DATA(self, line):
     def data_line_received(self, line):
+        resp = []
+        for m in self.__messages:
+            resp.append(m.eom_received())
+        
+        self._message_handled(resp)
+
+        del self.__messages
+        self.mode = COMMAND
+        '''
         if line[:1] == '.':
             if line == '.':
                 self.mode = COMMAND
@@ -887,11 +912,11 @@ class SMTPClientConnection(object):
             for message in self.__messages:
                 message.connection_lost()
         return True
+        '''
     
-    #state_DATA = data_line_received
-    def state_DATA(self, line):
-        if self.data_line_received(line):
-            self._stream.read_until(self.TERMINATOR, self._on_read_data)
+    state_DATA = data_line_received
+    #def state_DATA(self, line):
+        #if self.data_line_received(line): self._stream.read_until(self.get_terminator(), self._on_read_data)
 
     def _message_handled(self, resultList):
         failures = 0
@@ -945,6 +970,7 @@ class SMTPClientConnection(object):
 
     #----------------------------------------------------------------------
     def set_timeout(self, timeout=None, N=uniq_id().next):
+        '''        
         deadline = timeout if timeout else self.timeout
         if deadline is not None:
             deadline += time.time()
@@ -954,12 +980,15 @@ class SMTPClientConnection(object):
             
             self.__timeout_id = N()
             self.__timeout_obj = self._io_loop.add_timeout(deadline, self.__timed_out, self.__timeout_id)
+        '''
         
     def reset_timeout(self):
+        '''        
         if self.__timeout_obj is not None:
             self._io_loop.remove_timeout(self.__timeout_obj)
             self.__timeout_id = None
             self.__timeout_obj = None
+        '''
     
     def __timed_out(self, param):
         self.__timeout_obj = None
@@ -969,7 +998,7 @@ class SMTPClientConnection(object):
     #----------------------------------------------------------------------
     def timeout_connection(self):
         """"""
-        self.respond(421, 'Timeout. Try talking faster next time!', False)
+        self.respond(421, 'Timeout. Try talking faster next time!')
         self.close()        
 
 
@@ -1026,6 +1055,6 @@ class ConsoleMessage(MessageReceiver):
         self.lines = None
         print "Connection lost"
 
-srv = SMTPServer(None, None, ConsoleMessageDelivery())
+srv = SMTPServer(None, None, ConsoleMessageDelivery(), num_processes=2)
 srv.listen(8888)
 ioloop.IOLoop.instance().start()
