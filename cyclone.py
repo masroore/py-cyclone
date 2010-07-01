@@ -17,7 +17,6 @@
 import ioloop, iostream
 import logging, os, socket, types, re, sys, errno
 import time
-import threading
 
 try:
     import fcntl
@@ -57,7 +56,12 @@ class MessageDelivery(object):
         return None
     
     #----------------------------------------------------------------------
-    def reset_session(self, session_token):
+    def reset_sesion(self, session_token):
+        """"""
+        pass
+
+    #----------------------------------------------------------------------
+    def end_sesion(self, session_token):
         """"""
         pass
     
@@ -262,7 +266,8 @@ class SMTPServer(object):
     """SMTP Server"""
 
     #----------------------------------------------------------------------
-    def __init__(self, io_loop=None, watchdog=None, delivery=None, delivery_factory=None, num_processes=1):
+    def __init__(self, io_loop=None, watchdog=None, delivery=None, delivery_factory=None, num_processes=1,
+                 timeout_command = 5.0, timeout_data = 20.0, timeout_lifespan = 60.0):
         """Initializes the server with the given request callback.
 
         If you use pre-forking/start() instead of the listen() method to
@@ -277,6 +282,10 @@ class SMTPServer(object):
         self.delivery = delivery
         self.delivery_factory = delivery_factory
         self._num_processes = num_processes
+        self.timeout_command = timeout_command
+        self.timeout_data = timeout_data
+        self.timeout_lifespan = timeout_lifespan
+    
 
     def listen(self, port, address=""):
         """Binds to the given port and starts the server in a single process."""
@@ -298,7 +307,7 @@ class SMTPServer(object):
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._socket.setblocking(0)
         self._socket.bind((address, port))
-        self._socket.listen(128)
+        self._socket.listen(1000)
 
     def start(self, num_processes=None):
         """Starts this server in the IOLoop.
@@ -365,7 +374,15 @@ class SMTPServer(object):
                     return
             try:
                 stream = iostream.IOStream(sock, io_loop=self.io_loop)
-                SMTPClientConnection(self, self.io_loop, stream, peer, self.delivery, self.delivery_factory)
+                SMTPClientConnection(server=self, io_loop=self.io_loop, 
+                                     stream=stream, peer_addr=peer, 
+                                     delivery=self.delivery, 
+                                     delivery_factory=self.delivery_factory,
+                                     timeout_command = self.timeout_command, 
+                                     timeout_data = self.timeout_data, 
+                                     timeout_lifespan = self.timeout_lifespan, 
+                                     fqdn = HOST_NAME)
+                
             except:
                 logging.error("Error in connection callback", exc_info=True)
     
@@ -374,11 +391,6 @@ COMMAND, DATA, AUTH = 'COMMAND', 'DATA', 'AUTH'
 
 class SMTPClientConnection(object):
     """SMTP server-side protocol."""
-
-    timeout_command = 30.0
-    timeout_data = 30.0
-    timeout_lifespan = 60.0
-    fqdn = HOST_NAME
     TERM_EOL = '\r\n'
     TERM_EOM = '\r\n.\r\n'
 
@@ -396,7 +408,8 @@ class SMTPClientConnection(object):
     # of the connection.
     delivery = None
     
-    def __init__(self, server, io_loop, stream, peer_addr, delivery=None, delivery_factory=None):
+    def __init__(self, server, io_loop, stream, peer_addr, delivery=None, delivery_factory=None,
+                 timeout_command = 5.0, timeout_data = 20.0, timeout_lifespan = 60.0, fqdn = HOST_NAME):
         self._server = server
         self._io_loop = io_loop
         self._stream = stream
@@ -404,30 +417,34 @@ class SMTPClientConnection(object):
         self.peer_port = peer_addr[1]
         self.delivery = delivery
         self.delivery_factory = delivery_factory
+        self.timeout_command = timeout_command
+        self.timeout_data = timeout_data
+        self.timeout_lifespan = timeout_lifespan
+        self.fqdn = fqdn
+        
+        self.__timeout_obj = None
+        self.__timeout_id = None
+        if self.timeout_lifespan is not None:
+            self.__timeout_lifespan = self._io_loop.add_timeout(self.timeout_lifespan + time.time(),
+                                                                self.__timed_out_lifespan, None)
+
         self.mode = COMMAND
         self._from = None
         self._helo = None
         self._recipients = []
         self._pending_close = False
-        
-        self.__timeout_obj = None
-        self.__timeout_id = None
-        self.__timeout_lifespan = self._io_loop.add_timeout(self.timeout_lifespan + time.time(),
-                                                            self.__timed_out_lifespan, 
-                                                            None)
-        self._session_token = None        
+        self._session_token = None
         
         self.send_greeting()
-        self.post_read_request()
+        self.await_command()
         
     #----------------------------------------------------------------------
     def get_terminator(self):
-        return self.TERM_EOM if self.mode == DATA else self.TERM_EOL
+        return self.TERM_EOL if self.mode == COMMAND else self.TERM_EOM
     
     def __timed_out_lifespan(self, param):
         self.__timeout_lifespan = None
-        self.reset_session()
-        self.respond(421, "Game over pal! You just can't stay that long...")
+        #self.respond(421, "Game over pal! You just can't stay that long...")
         self.close()
 
     def send_greeting(self):
@@ -440,14 +457,22 @@ class SMTPClientConnection(object):
 
     def _close_connection(self):
         self.reset_timeout()
+        
         if self.__timeout_lifespan is not None: 
             self._io_loop.remove_timeout(self.__timeout_lifespan)
-        self.reset_session()
+
+        if self.delivery is not None:
+            self.delivery.end_sesion(self._session_token)
+        
         self._pending_close = False
         self._stream.close()        
         
-    def respond(self, status_code, message=''):
+    def respond(self, status_code, message):
         "Send an SMTP code with a message."
+        self.write('%3.3d %s\r\n' % (status_code, message))
+
+    def respond_multi(self, status_code, message):
+        "Send an SMTP code with multi-line message."
         lines = message.splitlines()
         lastline, tmplines = lines[-1:], []
         for line in lines[:-1]:
@@ -457,35 +482,33 @@ class SMTPClientConnection(object):
         
     def write_line(self, message):
         if not self._stream.closed():
-            self._stream.write(message + '\r\n', self._on_write_complete)
+            self._stream.write(message + self.TERM_EOL, self._on_write_complete)
     
-    def write(self, chunk):
+    def write(self, message):
         if not self._stream.closed():
-            self._stream.write(chunk, self._on_write_complete)
+            self._stream.write(message, self._on_write_complete)
     
     def _on_write_complete(self):
-        self.reset_timeout()
-        
         if self._pending_close:
             self._close_connection()
-            return
     
     #----------------------------------------------------------------------
-    def post_read_request(self, timeout=True):
+    def await_command(self, timeout=True):
         """"""
         if self._pending_close:
             return
         
-        self._stream.read_until(self.get_terminator(), self._on_read_data)
-        if timeout:
-            self.set_timeout()
+        if not self._stream.closed():
+            self._stream.read_until(self.get_terminator(), self._on_read_data)
+            if timeout:
+                self.set_timeout()
     
     def _on_read_data(self, data):
         #print '\t\t\t<<<%s' % data
         self.reset_timeout()
         ret = getattr(self, 'state_' + self.mode)(data)
         if ret != False:
-            self.post_read_request()
+            self.await_command()
     
     def state_COMMAND(self, line):
         # Ignore leading and trailing whitespace, as well as an arbitrary
@@ -511,7 +534,7 @@ class SMTPClientConnection(object):
 
     def smtp_HELO(self, arg):
         if not arg:
-            self.respond(501, 'HELO requires domain/address - see RFC-2821 4.1.1.1')
+            self.respond(501, 'HELO requires domain/address')
             return
         if self._helo:
             self.respond(503, 'but you already said HELO...')
@@ -531,7 +554,7 @@ class SMTPClientConnection(object):
         
     def smtp_NOOP(self, arg):
         if arg:
-            self.respond(250, 'Syntax: NOOP')
+            self.respond(501, 'Syntax: NOOP')
         else:
             self.respond(250, 'Ok')
         
@@ -703,8 +726,9 @@ class SMTPClientConnection(object):
 
     def state_DATA(self, data):
         self.mode = COMMAND
-        ret, msg = self.message_received(data)
-        self.reset_session()
+        ret, msg = self.message_received(data)        
+        self._from = None
+        self._recipients = []        
         if ret == ALLOW:
             self.respond(250, 'Delivery in progress')
         else:
@@ -721,11 +745,11 @@ class SMTPClientConnection(object):
             deadline = timeout
         else:
             deadline = self.timeout_data if self.mode == DATA else self.timeout_command
-        if deadline is not None:
+        if (deadline is not None) and (deadline > 0):
             deadline += time.time()
             if self.__timeout_obj is not None:
-                #self.reset_timeout(self)
-                self._io_loop.update_timeout(self.__timeout_obj, deadline)
+                self.reset_timeout(self)
+                #self._io_loop.update_timeout(self.__timeout_obj, deadline)
             
             self.__timeout_id = N()
             self.__timeout_obj = self._io_loop.add_timeout(deadline, self.__timed_out, self.__timeout_id)
@@ -759,10 +783,9 @@ class SMTPClientConnection(object):
     #----------------------------------------------------------------------
     def reset_session(self):
         """"""
-        if self.delivery is not None and self._session_token is not None:
-            self.delivery.reset_session(self._session_token)
+        if self.delivery is not None:
+            self.delivery.reset_sesion(self._session_token)
         
-        self._session_token = None
         self._from = None
         self._recipients = []
 
@@ -773,6 +796,11 @@ email = EmailAddress('abc@gmail.com')
 email = EmailAddress('samarah', 'kumkum.masroor')
 
 class DummyMessageDelivery(MessageDelivery):
+    
+    def __init__(self):
+        self._START = time.time()
+        self.cnt = 0
+        
     def validate_sender(self, session_token, helo, mailfrom):
         # All addresses are accepted
         return (ALLOW, mailfrom)
@@ -787,16 +815,21 @@ class DummyMessageDelivery(MessageDelivery):
         return DENY
     
     def message_received(self, session_token, mailfrom, rcpttos, data):
+        self.cnt += 1
+        
+        if self.cnt % 10000 == 0:
+            now = time.time()
+            seconds = now - self._START
+            print '%d mails | %d seconds | %d/sec' % (self.cnt, seconds, self.cnt / seconds)
+            self.cnt = 0
+            self._START = now
+        
         return (ALLOW, 'Ok')
     
-srv = SMTPServer(None, None, DummyMessageDelivery(), num_processes=1)
+srv = SMTPServer(None, None, DummyMessageDelivery(), num_processes=None,
+                 timeout_command = None, timeout_data = None, timeout_lifespan = None)
 srv.listen(8888)
 try:
-    #poller = threading.Thread(target=ioloop.IOLoop.instance().start)
-    #poller.start()
     ioloop.IOLoop.instance().start()
 except KeyboardInterrupt as key:
     srv.stop()
-    
-    
-    

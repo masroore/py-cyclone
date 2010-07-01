@@ -65,8 +65,8 @@ class IOStream(object):
         self.io_loop = io_loop or ioloop.IOLoop.instance()
         self.max_buffer_size = max_buffer_size
         self.read_chunk_size = read_chunk_size
-        self._read_buffer = ""
-        self._write_buffer = ""
+        self._read_buffer = b""
+        self._write_buffer = b""
         self._read_delimiter = None
         self._read_bytes = None
         self._read_callback = None
@@ -74,7 +74,8 @@ class IOStream(object):
         self._close_callback = None
         self._state = self.io_loop.ERROR
         self.io_loop.add_handler(
-            self.socket.fileno(), self._handle_events, self._state)
+            self.socket.fileno(), 
+            self._handle_events, self._state)
 
     #----------------------------------------------------------------------
     def _check_delim(self, delimiter, callback):
