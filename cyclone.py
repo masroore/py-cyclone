@@ -56,12 +56,12 @@ class MessageDelivery(object):
         return None
     
     #----------------------------------------------------------------------
-    def reset_sesion(self, session_token):
+    def reset_session(self, session_token):
         """"""
         pass
 
     #----------------------------------------------------------------------
-    def end_sesion(self, session_token):
+    def end_session(self, session_token):
         """"""
         pass
     
@@ -462,7 +462,7 @@ class SMTPClientConnection(object):
             self._io_loop.remove_timeout(self.__timeout_lifespan)
 
         if self.delivery is not None:
-            self.delivery.end_sesion(self._session_token)
+            self.delivery.end_session(self._session_token)
         
         self._pending_close = False
         self._stream.close()        
@@ -784,7 +784,7 @@ class SMTPClientConnection(object):
     def reset_session(self):
         """"""
         if self.delivery is not None:
-            self.delivery.reset_sesion(self._session_token)
+            self.delivery.reset_session(self._session_token)
         
         self._from = None
         self._recipients = []
