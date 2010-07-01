@@ -26,6 +26,10 @@ except ImportError:
     else:
         raise
 
+__all__ = ['set_debug_level', 'ServerWatchdog', 'MessageDelivery', 
+           'MessageDeliveryFactory', 'AddressError', 'EmailAddress', 
+           'SMTPServer', 'SMTPClientConnection', 'uniq_id']
+
 # Cache the hostname (XXX Yes - this is broken)
 HOST_NAME = socket.gethostname() if sys.platform == 'darwin' else socket.getfqdn()
 
@@ -36,6 +40,30 @@ def uniq_id():
     while True:
         yield i
         i += 1
+
+#----------------------------------------------------------------------
+_DEBUG_LEVEL = 0
+
+#----------------------------------------------------------------------
+def set_debug_level(level):
+    """"""
+    if _DEBUG_LEVEL != level:
+        _DEBUG_LEVEL = level
+
+def _warn(msg, * args, ** kwargs):
+    """"""
+    if _DEBUG_LEVEL > 0:
+        logging.warn(msg, args, kwargs)
+    
+def _error(msg, * args, ** kwargs):
+    """"""
+    if _DEBUG_LEVEL > 0:
+        logging.error(msg, args, kwargs)
+
+def _info(msg, * args, ** kwargs):
+    """"""
+    if _DEBUG_LEVEL > 0:
+        logging.info(msg, args, kwargs)
 
 ########################################################################
 class ServerWatchdog:
@@ -330,16 +358,16 @@ class SMTPServer(object):
             try:
                 num_processes = os.sysconf("SC_NPROCESSORS_CONF")
             except ValueError:
-                logging.error("Could not get num processors from sysconf; "
-                              "running with one process")
+                _error("Could not get num processors from sysconf; "
+                       "running with one process")
                 num_processes = 1
         if num_processes > 1 and ioloop.IOLoop.initialized():
-            logging.error("Cannot run in multiple processes: IOLoop instance "
-                          "has already been initialized. You cannot call "
-                          "IOLoop.instance() before calling start()")
+            _error("Cannot run in multiple processes: IOLoop instance "
+                   "has already been initialized. You cannot call "
+                   "IOLoop.instance() before calling start()")
             num_processes = 1
         if num_processes > 1:
-            logging.info("Pre-forking %d server processes", num_processes)
+            _info("Pre-forking %d server processes", num_processes)
             for i in range(num_processes):
                 if os.fork() == 0:
                     self.io_loop = ioloop.IOLoop.instance()
@@ -384,7 +412,7 @@ class SMTPServer(object):
                                      fqdn = HOST_NAME)
                 
             except:
-                logging.error("Error in connection callback", exc_info=True)
+                _error("Error in connection callback", exc_info=True)
     
 
 COMMAND, DATA, AUTH = 'COMMAND', 'DATA', 'AUTH'
@@ -620,7 +648,7 @@ class SMTPClientConnection(object):
                 self.close()
                 return False
         except Exception, exc:
-            logging.error("SMTP sender (%s) validation failure %s" % (addr, exc))
+            _error("SMTP sender (%s) validation failure %s" % (addr, exc))
             self.respond(451, 'Internal server error')
             return
         
@@ -684,7 +712,7 @@ class SMTPClientConnection(object):
                 self.close()
                 return False
         except Exception, exc:
-            logging.error("SMTP receiver (%s) validation failure" % (addr,))
+            _error("SMTP receiver (%s) validation failure" % (addr,))
             self.respond(451, 'Internal server error')            
             return
         
@@ -722,7 +750,7 @@ class SMTPClientConnection(object):
             
         #if True:
         #fmt = 'Receiving message for delivery: from=%s to=%s'
-        #logging.error(fmt % (origin, [str(u) for (u, f) in recipients]))
+        #_error(fmt % (origin, [str(u) for (u, f) in recipients]))
 
     def state_DATA(self, data):
         self.mode = COMMAND
